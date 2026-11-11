@@ -1,0 +1,291 @@
+name: GitHub RDP + True Speed Bonding Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      bond_secret:
+        description: 'Optional secret password for your Bonding Server'
+        required: false
+        default: ''
+      enable_rdp:
+        description: 'Also start Windows RDP (Tailscale / Ngrok) alongside the Bonding Server?'
+        required: false
+        default: 'false'
+
+jobs:
+  speed-bonding-server:
+    name: True 3-Way Speed Bonding Relay
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository (if rdp-server.js is in repo)
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Write Standalone True Bonding Server (rdp-server.js)
+        run: |
+          if [ ! -f rdp-server.js ]; then
+            cat << 'EOF' > rdp-server.js
+          'use strict';
+          const http   = require('http');
+          const net    = require('net');
+          const crypto = require('crypto');
+
+          const PORT       = parseInt(process.env.PORT || '8080', 10);
+          const SECRET     = process.env.BOND_SECRET || '';
+          const CHUNK_SIZE = 32 * 1024;
+          const MAX_BUFFER_PER_PIPE = 512 * 1024;
+
+          const FRAME = { OPEN: 0x01, OPEN_OK: 0x02, DATA: 0x03, CLOSE: 0x04, PING: 0x05, PONG: 0x06 };
+
+          class LiteWebSocket {
+            constructor(socket) {
+              this.socket = socket;
+              this.socket.setNoDelay(true);
+              this.socket.setKeepAlive(true, 15000);
+              this.readyState = 1;
+              this.meta = {};
+              this._buf = Buffer.alloc(0);
+              this._frags = [];
+              this._listeners = { message: [], close: [], error: [], drain: [] };
+              socket.on('data', chunk => this._onData(chunk));
+              socket.on('drain', () => this._emit('drain'));
+              socket.on('close', () => { this.readyState = 3; this._emit('close'); });
+              socket.on('error', err => { this.readyState = 3; this._emit('error', err); });
+            }
+            get bufferedAmount() { return this.socket ? this.socket.writableLength : 0; }
+            on(ev, fn) { if (this._listeners[ev]) this._listeners[ev].push(fn); }
+            _emit(ev, arg) { for (const fn of this._listeners[ev] || []) { try { fn(arg); } catch {} } }
+            send(payload) {
+              if (this.readyState !== 1) return false;
+              const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+              const len = data.length;
+              let header;
+              if (len < 126) {
+                header = Buffer.from([0x82, len]);
+              } else if (len < 65536) {
+                header = Buffer.allocUnsafe(4);
+                header[0] = 0x82; header[1] = 126; header.writeUInt16BE(len, 2);
+              } else {
+                header = Buffer.allocUnsafe(10);
+                header[0] = 0x82; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
+              }
+              return this.socket.write(Buffer.concat([header, data]));
+            }
+            close() {
+              if (this.readyState !== 1) return;
+              this.readyState = 3;
+              try { this.socket.end(Buffer.from([0x88, 0x00])); setTimeout(() => this.socket.destroy(), 500); } catch {}
+            }
+            _onData(chunk) {
+              this._buf = Buffer.concat([this._buf, chunk]);
+              while (this._buf.length >= 2) {
+                const b0 = this._buf[0], b1 = this._buf[1];
+                const fin = (b0 & 0x80) !== 0, opcode = b0 & 0x0f, masked = (b1 & 0x80) !== 0;
+                let len = b1 & 0x7f, offset = 2;
+                if (len === 126) { if (this._buf.length < 4) return; len = this._buf.readUInt16BE(2); offset = 4; }
+                else if (len === 127) { if (this._buf.length < 10) return; len = Number(this._buf.readBigUInt64BE(2)); offset = 10; }
+                const maskOffset = offset;
+                if (masked) offset += 4;
+                if (this._buf.length < offset + len) return;
+                const payload = this._buf.subarray(offset, offset + len);
+                if (masked) {
+                  const mask = this._buf.subarray(maskOffset, maskOffset + 4);
+                  for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+                }
+                const frameData = Buffer.from(payload);
+                this._buf = this._buf.subarray(offset + len);
+                if (opcode === 0x08) { this.close(); return; }
+                else if (opcode === 0x09) {
+                  if (this.readyState === 1) {
+                    const pong = Buffer.allocUnsafe(2 + frameData.length);
+                    pong[0] = 0x8a; pong[1] = frameData.length; frameData.copy(pong, 2);
+                    this.socket.write(pong);
+                  }
+                } else if (opcode === 0x01 || opcode === 0x02 || opcode === 0x00) {
+                  this._frags.push(frameData);
+                  if (fin) {
+                    const full = this._frags.length === 1 ? this._frags[0] : Buffer.concat(this._frags);
+                    this._frags = [];
+                    this._emit('message', full);
+                  }
+                }
+              }
+            }
+          }
+
+          const pipes = new Set();
+          const streams = new Map();
+          let rrIndex = 0;
+
+          function pickBestPipe() {
+            const active = [];
+            for (const ws of pipes) if (ws.readyState === 1) active.push(ws);
+            if (!active.length) return null;
+            if (active.length === 1) return active[0];
+            let best = null, minBuf = Infinity;
+            const len = active.length, start = (rrIndex++) % len;
+            for (let i = 0; i < len; i++) {
+              const c = active[(start + i) % len];
+              if (c.bufferedAmount < minBuf) { minBuf = c.bufferedAmount; best = c; if (minBuf === 0) break; }
+            }
+            return best;
+          }
+
+          function allPipesSaturated() {
+            for (const ws of pipes) if (ws.readyState === 1 && ws.bufferedAmount < MAX_BUFFER_PER_PIPE) return false;
+            return pipes.size > 0;
+          }
+
+          function resumePausedStreams() {
+            if (allPipesSaturated()) return;
+            for (const st of streams.values()) {
+              if (st.readingPaused && st.remote && !st.closed) { st.readingPaused = false; st.remote.resume(); }
+            }
+          }
+
+          function closeStream(streamId, notify = true) {
+            const st = streams.get(streamId);
+            if (!st || st.closed) return;
+            st.closed = true;
+            streams.delete(streamId);
+            if (st.remote) { try { st.remote.destroy(); } catch {} }
+            st.upHold.clear();
+            if (notify) {
+              const pipe = pickBestPipe();
+              if (pipe) {
+                const f = Buffer.allocUnsafe(5);
+                f[0] = FRAME.CLOSE; f.writeUInt32BE(streamId, 1);
+                pipe.send(f);
+              }
+            }
+          }
+
+          function flushUpload(st) {
+            if (!st.connected || !st.remote || st.closed) return;
+            while (st.upHold.has(st.upNextSeq)) {
+              const chunk = st.upHold.get(st.upNextSeq);
+              st.upHold.delete(st.upNextSeq++);
+              if (chunk.length) st.remote.write(chunk);
+            }
+          }
+
+          function openStream(streamId, host, port) {
+            if (streams.has(streamId)) return;
+            const st = { streamId, host, port, remote: null, connected: false, closed: false, upNextSeq: 0, upHold: new Map(), downSeq: 0, readingPaused: false };
+            streams.set(streamId, st);
+            const remote = net.createConnection({ host, port });
+            st.remote = remote;
+            remote.setNoDelay(true);
+            const t = setTimeout(() => { if (!st.connected) closeStream(streamId, true); }, 10000);
+            remote.on('connect', () => {
+              clearTimeout(t);
+              if (st.closed) { remote.destroy(); return; }
+              st.connected = true;
+              const pipe = pickBestPipe();
+              if (pipe) {
+                const ok = Buffer.allocUnsafe(5);
+                ok[0] = FRAME.OPEN_OK; ok.writeUInt32BE(streamId, 1);
+                pipe.send(ok);
+              }
+              flushUpload(st);
+            });
+            remote.on('data', chunk => {
+              if (st.closed) return;
+              for (let off = 0; off < chunk.length; off += CHUNK_SIZE) {
+                const slice = chunk.subarray(off, Math.min(off + CHUNK_SIZE, chunk.length));
+                const f = Buffer.allocUnsafe(9 + slice.length);
+                f[0] = FRAME.DATA; f.writeUInt32BE(streamId, 1); f.writeUInt32BE(st.downSeq++, 5);
+                slice.copy(f, 9);
+                const pipe = pickBestPipe();
+                if (!pipe) { closeStream(streamId, false); return; }
+                pipe.send(f);
+              }
+              if (allPipesSaturated() && !st.readingPaused) { st.readingPaused = true; remote.pause(); }
+            });
+            remote.on('end', () => closeStream(streamId, true));
+            remote.on('close', () => closeStream(streamId, true));
+            remote.on('error', () => closeStream(streamId, true));
+          }
+
+          const server = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, activePipes: pipes.size, activeStreams: streams.size }));
+          });
+
+          server.on('upgrade', (req, socket) => {
+            const url = new URL(req.url, 'http://localhost');
+            const secret = url.searchParams.get('secret') || '';
+            if (SECRET && secret !== SECRET) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+            const key = req.headers['sec-websocket-key'];
+            if (!key) { socket.destroy(); return; }
+            const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+            socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+            const ws = new LiteWebSocket(socket);
+            ws.meta = { adapter: url.searchParams.get('adapter') || req.socket.remoteAddress };
+            pipes.add(ws);
+            console.log('[BOND] + Pipe connected:', ws.meta.adapter, '| Total:', pipes.size);
+            ws.on('message', buf => {
+              if (!buf || !buf.length) return;
+              const type = buf[0];
+              if (type === FRAME.OPEN && buf.length >= 8) {
+                openStream(buf.readUInt32BE(1), buf.subarray(7).toString('utf8'), buf.readUInt16BE(5));
+              } else if (type === FRAME.DATA && buf.length >= 9) {
+                const st = streams.get(buf.readUInt32BE(1));
+                if (st && !st.closed) { st.upHold.set(buf.readUInt32BE(5), buf.subarray(9)); flushUpload(st); }
+              } else if (type === FRAME.CLOSE && buf.length >= 5) {
+                closeStream(buf.readUInt32BE(1), false);
+              } else if (type === FRAME.PING) {
+                const pong = Buffer.from(buf); pong[0] = FRAME.PONG; ws.send(pong);
+              }
+            });
+            ws.on('drain', resumePausedStreams);
+            ws.on('close', () => { pipes.delete(ws); console.log('[BOND] - Pipe closed:', ws.meta.adapter, '| Total:', pipes.size); });
+            ws.on('error', () => pipes.delete(ws));
+          });
+
+          server.listen(PORT, '0.0.0.0', () => console.log('Bonding Server listening on', PORT));
+          EOF
+          fi
+
+      - name: Start Bonding Server + Public Cloudflare Tunnel (Prints Your URL!)
+        env:
+          BOND_SECRET: ${{ github.event.inputs.bond_secret }}
+        run: |
+          # 1. Start the Node.js True Bonding Server in the background
+          PORT=8080 node rdp-server.js &
+
+          # 2. Download cloudflared
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+          # 3. Start Cloudflare Quick Tunnel and print the public URL clearly in the GitHub Actions log
+          ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate 2>&1 | tee tunnel.log &
+
+          echo "Waiting for your public Bonding Tunnel URL..."
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$URL" ]; then
+              echo ""
+              echo "=================================================================="
+              echo "⚡ YOUR GITHUB RDP BONDING URL IS READY! COPY & PASTE THIS:"
+              echo "👉 $URL"
+              echo "=================================================================="
+              echo ""
+              break
+            fi
+            sleep 2
+          done
+
+          # Keep the runner alive for up to 6 hours while printing live stats every 60s
+          while true; do
+            sleep 60
+            curl -s http://localhost:8080/health || true
+            echo ""
+          done
