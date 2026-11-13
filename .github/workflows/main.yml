@@ -15,6 +15,7 @@ on:
 jobs:
   speed-bonding-server:
     name: True 3-Way Speed Bonding Relay
+    name: True 3-Way Speed Bonding Relay v3
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -29,9 +30,11 @@ jobs:
           node-version: '20'
 
       - name: Write Standalone True Bonding Server (rdp-server.js)
+      - name: Write High-Speed Bonding Server v3 (rdp-server.js)
         run: |
           if [ ! -f rdp-server.js ]; then
             cat << 'EOF' > rdp-server.js
+          cat << 'EOF' > rdp-server.js
           'use strict';
           const http   = require('http');
           const net    = require('net');
@@ -42,6 +45,8 @@ jobs:
           const CHUNK_SIZE = 32 * 1024;
           const MAX_BUFFER_PER_PIPE = 512 * 1024;
 
+          const CHUNK_SIZE = 16 * 1024;
+          const MAX_BUFFER_PER_PIPE = 256 * 1024;
           const FRAME = { OPEN: 0x01, OPEN_OK: 0x02, DATA: 0x03, CLOSE: 0x04, PING: 0x05, PONG: 0x06 };
 
           class LiteWebSocket {
@@ -76,6 +81,9 @@ jobs:
                 header = Buffer.allocUnsafe(10);
                 header[0] = 0x82; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
               }
+              if (len < 126) header = Buffer.from([0x82, len]);
+              else if (len < 65536) { header = Buffer.allocUnsafe(4); header[0] = 0x82; header[1] = 126; header.writeUInt16BE(len, 2); }
+              else { header = Buffer.allocUnsafe(10); header[0] = 0x82; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2); }
               return this.socket.write(Buffer.concat([header, data]));
             }
             close() {
@@ -125,14 +133,35 @@ jobs:
           let rrIndex = 0;
 
           function pickBestPipe() {
+          function pickControlPipe() {
             const active = [];
             for (const ws of pipes) if (ws.readyState === 1) active.push(ws);
             if (!active.length) return null;
             if (active.length === 1) return active[0];
+            const ctrl = active.filter(ws => ws.meta.role === 'control');
+            const pool = ctrl.length ? ctrl : active;
+            let best = pool[0], minBuf = Infinity;
+            for (const c of pool) {
+              if (c.bufferedAmount < minBuf) { minBuf = c.bufferedAmount; best = c; }
+            }
+            return best;
+          }
+
+          function pickDataPipe(preferredPipe) {
+            if (preferredPipe && preferredPipe.readyState === 1 && preferredPipe.bufferedAmount < 64 * 1024) {
+              return preferredPipe;
+            }
+            const active = [];
+            for (const ws of pipes) if (ws.readyState === 1 && ws.meta.role !== 'control') active.push(ws);
+            const pool = active.length ? active : Array.from(pipes).filter(ws => ws.readyState === 1);
+            if (!pool.length) return null;
+            if (pool.length === 1) return pool[0];
             let best = null, minBuf = Infinity;
             const len = active.length, start = (rrIndex++) % len;
+            const len = pool.length, start = (rrIndex++) % len;
             for (let i = 0; i < len; i++) {
               const c = active[(start + i) % len];
+              const c = pool[(start + i) % len];
               if (c.bufferedAmount < minBuf) { minBuf = c.bufferedAmount; best = c; if (minBuf === 0) break; }
             }
             return best;
@@ -140,6 +169,7 @@ jobs:
 
           function allPipesSaturated() {
             for (const ws of pipes) if (ws.readyState === 1 && ws.bufferedAmount < MAX_BUFFER_PER_PIPE) return false;
+            for (const ws of pipes) if (ws.readyState === 1 && ws.meta.role !== 'control' && ws.bufferedAmount < MAX_BUFFER_PER_PIPE) return false;
             return pipes.size > 0;
           }
 
@@ -159,6 +189,7 @@ jobs:
             st.upHold.clear();
             if (notify) {
               const pipe = pickBestPipe();
+              const pipe = pickControlPipe();
               if (pipe) {
                 const f = Buffer.allocUnsafe(5);
                 f[0] = FRAME.CLOSE; f.writeUInt32BE(streamId, 1);
@@ -177,8 +208,10 @@ jobs:
           }
 
           function openStream(streamId, host, port) {
+          function openStream(streamId, host, port, sourcePipe) {
             if (streams.has(streamId)) return;
             const st = { streamId, host, port, remote: null, connected: false, closed: false, upNextSeq: 0, upHold: new Map(), downSeq: 0, readingPaused: false };
+            const st = { streamId, host, port, preferredPipe: sourcePipe, remote: null, connected: false, closed: false, upNextSeq: 0, upHold: new Map(), downSeq: 0, readingPaused: false };
             streams.set(streamId, st);
             const remote = net.createConnection({ host, port });
             st.remote = remote;
@@ -189,6 +222,7 @@ jobs:
               if (st.closed) { remote.destroy(); return; }
               st.connected = true;
               const pipe = pickBestPipe();
+              const pipe = pickControlPipe();
               if (pipe) {
                 const ok = Buffer.allocUnsafe(5);
                 ok[0] = FRAME.OPEN_OK; ok.writeUInt32BE(streamId, 1);
@@ -204,6 +238,7 @@ jobs:
                 f[0] = FRAME.DATA; f.writeUInt32BE(streamId, 1); f.writeUInt32BE(st.downSeq++, 5);
                 slice.copy(f, 9);
                 const pipe = pickBestPipe();
+                const pipe = pickDataPipe(st.preferredPipe);
                 if (!pipe) { closeStream(streamId, false); return; }
                 pipe.send(f);
               }
@@ -229,6 +264,7 @@ jobs:
             socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
             const ws = new LiteWebSocket(socket);
             ws.meta = { adapter: url.searchParams.get('adapter') || req.socket.remoteAddress };
+            ws.meta = { adapter: url.searchParams.get('adapter') || req.socket.remoteAddress, role: url.searchParams.get('role') || 'data' };
             pipes.add(ws);
             console.log('[BOND] + Pipe connected:', ws.meta.adapter, '| Total:', pipes.size);
             ws.on('message', buf => {
@@ -236,6 +272,7 @@ jobs:
               const type = buf[0];
               if (type === FRAME.OPEN && buf.length >= 8) {
                 openStream(buf.readUInt32BE(1), buf.subarray(7).toString('utf8'), buf.readUInt16BE(5));
+                openStream(buf.readUInt32BE(1), buf.subarray(7).toString('utf8'), buf.readUInt16BE(5), ws);
               } else if (type === FRAME.DATA && buf.length >= 9) {
                 const st = streams.get(buf.readUInt32BE(1));
                 if (st && !st.closed) { st.upHold.set(buf.readUInt32BE(5), buf.subarray(9)); flushUpload(st); }
@@ -251,6 +288,7 @@ jobs:
           });
 
           server.listen(PORT, '0.0.0.0', () => console.log('Bonding Server listening on', PORT));
+          server.listen(PORT, '0.0.0.0', () => console.log('Bonding Server v3 listening on', PORT));
           EOF
           fi
 
@@ -271,6 +309,7 @@ jobs:
           echo "Waiting for your public Bonding Tunnel URL..."
           for i in $(seq 1 30); do
             URL=$(grep -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' tunnel.log | head -n 1 || true)
+            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
             if [ -n "$URL" ]; then
               echo ""
               echo "=================================================================="
