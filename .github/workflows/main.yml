@@ -1,4 +1,4 @@
-name: GitHub RDP + True Speed Bonding Server
+name: GitHub RDP + True Speed Bonding Server v3
 
 on:
   workflow_dispatch:
@@ -7,33 +7,21 @@ on:
         description: 'Optional secret password for your Bonding Server'
         required: false
         default: ''
-      enable_rdp:
-        description: 'Also start Windows RDP (Tailscale / Ngrok) alongside the Bonding Server?'
-        required: false
-        default: 'false'
 
 jobs:
   speed-bonding-server:
-    name: True 3-Way Speed Bonding Relay
     name: True 3-Way Speed Bonding Relay v3
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Checkout repository (if rdp-server.js is in repo)
-        uses: actions/checkout@v4
-        continue-on-error: true
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Write Standalone True Bonding Server (rdp-server.js)
       - name: Write High-Speed Bonding Server v3 (rdp-server.js)
         run: |
-          if [ ! -f rdp-server.js ]; then
-            cat << 'EOF' > rdp-server.js
           cat << 'EOF' > rdp-server.js
           'use strict';
           const http   = require('http');
@@ -42,9 +30,6 @@ jobs:
 
           const PORT       = parseInt(process.env.PORT || '8080', 10);
           const SECRET     = process.env.BOND_SECRET || '';
-          const CHUNK_SIZE = 32 * 1024;
-          const MAX_BUFFER_PER_PIPE = 512 * 1024;
-
           const CHUNK_SIZE = 16 * 1024;
           const MAX_BUFFER_PER_PIPE = 256 * 1024;
           const FRAME = { OPEN: 0x01, OPEN_OK: 0x02, DATA: 0x03, CLOSE: 0x04, PING: 0x05, PONG: 0x06 };
@@ -72,15 +57,6 @@ jobs:
               const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
               const len = data.length;
               let header;
-              if (len < 126) {
-                header = Buffer.from([0x82, len]);
-              } else if (len < 65536) {
-                header = Buffer.allocUnsafe(4);
-                header[0] = 0x82; header[1] = 126; header.writeUInt16BE(len, 2);
-              } else {
-                header = Buffer.allocUnsafe(10);
-                header[0] = 0x82; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
-              }
               if (len < 126) header = Buffer.from([0x82, len]);
               else if (len < 65536) { header = Buffer.allocUnsafe(4); header[0] = 0x82; header[1] = 126; header.writeUInt16BE(len, 2); }
               else { header = Buffer.allocUnsafe(10); header[0] = 0x82; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2); }
@@ -132,12 +108,10 @@ jobs:
           const streams = new Map();
           let rrIndex = 0;
 
-          function pickBestPipe() {
           function pickControlPipe() {
             const active = [];
             for (const ws of pipes) if (ws.readyState === 1) active.push(ws);
             if (!active.length) return null;
-            if (active.length === 1) return active[0];
             const ctrl = active.filter(ws => ws.meta.role === 'control');
             const pool = ctrl.length ? ctrl : active;
             let best = pool[0], minBuf = Infinity;
@@ -157,10 +131,8 @@ jobs:
             if (!pool.length) return null;
             if (pool.length === 1) return pool[0];
             let best = null, minBuf = Infinity;
-            const len = active.length, start = (rrIndex++) % len;
             const len = pool.length, start = (rrIndex++) % len;
             for (let i = 0; i < len; i++) {
-              const c = active[(start + i) % len];
               const c = pool[(start + i) % len];
               if (c.bufferedAmount < minBuf) { minBuf = c.bufferedAmount; best = c; if (minBuf === 0) break; }
             }
@@ -168,7 +140,6 @@ jobs:
           }
 
           function allPipesSaturated() {
-            for (const ws of pipes) if (ws.readyState === 1 && ws.bufferedAmount < MAX_BUFFER_PER_PIPE) return false;
             for (const ws of pipes) if (ws.readyState === 1 && ws.meta.role !== 'control' && ws.bufferedAmount < MAX_BUFFER_PER_PIPE) return false;
             return pipes.size > 0;
           }
@@ -188,7 +159,6 @@ jobs:
             if (st.remote) { try { st.remote.destroy(); } catch {} }
             st.upHold.clear();
             if (notify) {
-              const pipe = pickBestPipe();
               const pipe = pickControlPipe();
               if (pipe) {
                 const f = Buffer.allocUnsafe(5);
@@ -207,10 +177,8 @@ jobs:
             }
           }
 
-          function openStream(streamId, host, port) {
           function openStream(streamId, host, port, sourcePipe) {
             if (streams.has(streamId)) return;
-            const st = { streamId, host, port, remote: null, connected: false, closed: false, upNextSeq: 0, upHold: new Map(), downSeq: 0, readingPaused: false };
             const st = { streamId, host, port, preferredPipe: sourcePipe, remote: null, connected: false, closed: false, upNextSeq: 0, upHold: new Map(), downSeq: 0, readingPaused: false };
             streams.set(streamId, st);
             const remote = net.createConnection({ host, port });
@@ -221,7 +189,6 @@ jobs:
               clearTimeout(t);
               if (st.closed) { remote.destroy(); return; }
               st.connected = true;
-              const pipe = pickBestPipe();
               const pipe = pickControlPipe();
               if (pipe) {
                 const ok = Buffer.allocUnsafe(5);
@@ -237,7 +204,6 @@ jobs:
                 const f = Buffer.allocUnsafe(9 + slice.length);
                 f[0] = FRAME.DATA; f.writeUInt32BE(streamId, 1); f.writeUInt32BE(st.downSeq++, 5);
                 slice.copy(f, 9);
-                const pipe = pickBestPipe();
                 const pipe = pickDataPipe(st.preferredPipe);
                 if (!pipe) { closeStream(streamId, false); return; }
                 pipe.send(f);
@@ -263,7 +229,6 @@ jobs:
             const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
             socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
             const ws = new LiteWebSocket(socket);
-            ws.meta = { adapter: url.searchParams.get('adapter') || req.socket.remoteAddress };
             ws.meta = { adapter: url.searchParams.get('adapter') || req.socket.remoteAddress, role: url.searchParams.get('role') || 'data' };
             pipes.add(ws);
             console.log('[BOND] + Pipe connected:', ws.meta.adapter, '| Total:', pipes.size);
@@ -271,7 +236,6 @@ jobs:
               if (!buf || !buf.length) return;
               const type = buf[0];
               if (type === FRAME.OPEN && buf.length >= 8) {
-                openStream(buf.readUInt32BE(1), buf.subarray(7).toString('utf8'), buf.readUInt16BE(5));
                 openStream(buf.readUInt32BE(1), buf.subarray(7).toString('utf8'), buf.readUInt16BE(5), ws);
               } else if (type === FRAME.DATA && buf.length >= 9) {
                 const st = streams.get(buf.readUInt32BE(1));
@@ -287,28 +251,19 @@ jobs:
             ws.on('error', () => pipes.delete(ws));
           });
 
-          server.listen(PORT, '0.0.0.0', () => console.log('Bonding Server listening on', PORT));
           server.listen(PORT, '0.0.0.0', () => console.log('Bonding Server v3 listening on', PORT));
           EOF
-          fi
 
       - name: Start Bonding Server + Public Cloudflare Tunnel (Prints Your URL!)
         env:
           BOND_SECRET: ${{ github.event.inputs.bond_secret }}
         run: |
-          # 1. Start the Node.js True Bonding Server in the background
           PORT=8080 node rdp-server.js &
-
-          # 2. Download cloudflared
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
-
-          # 3. Start Cloudflare Quick Tunnel and print the public URL clearly in the GitHub Actions log
           ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate 2>&1 | tee tunnel.log &
 
-          echo "Waiting for your public Bonding Tunnel URL..."
           for i in $(seq 1 30); do
-            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' tunnel.log | head -n 1 || true)
             URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
             if [ -n "$URL" ]; then
               echo ""
@@ -322,7 +277,6 @@ jobs:
             sleep 2
           done
 
-          # Keep the runner alive for up to 6 hours while printing live stats every 60s
           while true; do
             sleep 60
             curl -s http://localhost:8080/health || true
